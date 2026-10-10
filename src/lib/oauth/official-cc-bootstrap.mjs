@@ -49,6 +49,7 @@ import { atomicWriteJson, listVmRecordFiles } from '../vm/vm-file.mjs'
 import { CONTAINER_CLI_NODE_BIN, normalizeOfficialCcInference, resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 
 export { officialCcUidGid } from '../vm/vm-runtime.mjs'
 export const DEFAULT_HELLO_PROMPT = 'hello'
@@ -1064,6 +1065,15 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
   const startedAt = new Date().toISOString()
   if (!canOfficialCc(credentialModeOfVm(vm))) {
     return { ok: false, error: 'official Claude Code init requires full OAuth' }
+  }
+  // The bootstrap drives a PTY CLI through docker exec and resizes the container's
+  // memory; a KVM guest has neither. Import credentials or use the OAuth flow instead.
+  if (isKvmRuntime(vm)) {
+    return {
+      ok: false,
+      code: 'kvm_official_cc_unsupported',
+      error: 'official Claude Code init is not supported on KVM slots yet',
+    }
   }
   if (!(hasAccessPresence(vm.claude) || hasRefreshPresence(vm.claude))) {
     const credFile = path.join(homeDir, '.claude', 'credentials.json')

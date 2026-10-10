@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- KVM 槽位：`vm.runtime.type = "kvm"` 的槽仍是同名 Docker 容器、同一 `kin-eg-*` 网络，镜像换成 `kin-vmm-<os>`，容器内用 cloud-hypervisor v53 起微虚拟机，客户机内核独立（`uname` 不再是宿主内核）。`/run/kin`、`/home/kincli` 经 virtiofs 共享，`run/kernel.sock` 由运行器经 vsock 桥进客户机，控制面拨号方式不变；`docker exec` 统一改写进客户机。出口仍由宿主网桥的 kin-egress 转 SOCKS5、`FORWARD DROP` 兜底，宿主不加新规则。DMI 厂商 / 型号 / 序列号 / UUID 与 MAC 按槽派生，随指纹重置轮换。新增 Go 二进制 `kin-guest`（客户机 PID1 / kernel.sock 桥 / exec 通道），新增 `guest-images` 的 `vmm` 任务构建 `kin-vmm-*` 镜像。需要宿主 `/dev/kvm`；集群节点与官方 CC 初始化暂不支持，分别返回 `kvm_remote_unsupported`、`kvm_official_cc_unsupported`。见 [docs/KVM.md](docs/KVM.md)。
+
+已部署机升级：更新 Node 控制面，重启一次 Node。现有 Docker 槽不受影响；无迁移。要用 KVM 槽需先拉取 `kin-vmm-<os>` 镜像，并确认宿主 `/dev/kvm` 可用。
+
 ## 1.3.135 — 2026-10-09
 
 - 对话中途 `role=system` 的模型白名单按官方文档补齐：Fable 5 / 5.1、Mythos 5 / 5.1、Opus 4.8 的这类轮次按原位发出，不再拼进顶层 `system`。之前这些模型的 `system` 每轮变长，提示缓存从 `system` 处断开，后面整段对话每轮重写 1h 缓存。文档列明 Sonnet 5 不支持，它的这类轮次改为挪进顶层 `system`（#324）。

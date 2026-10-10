@@ -5,6 +5,8 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
 import { slotHost } from './slot-host.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
+import { kvmExecArgs } from './kvm-runtime.mjs'
 
 const exec = promisify(execFile)
 const PROBE = String.raw`
@@ -14,6 +16,10 @@ rust=0; go=0; telemetry=0
 case "$main" in
   kin-kernel|*/kin-kernel|kin-kernel.bin|*/kin-kernel.bin) rust=1 ;;
   kin-worker|*/kin-worker) go=1 ;;
+  # KVM guest: kin-guest is PID1 and supervises the kernel as its child.
+  kin-guest|*/kin-guest) for d in /proc/[0-9]*; do
+      tr '\000' '\n' < "$d/cmdline" 2>/dev/null | grep -Eq '(^|/)kin-kernel(\.bin)?$' && { rust=1; break; }
+    done ;;
   */ld-linux-*.so.*|*/qemu-*)
     # The shipped kernel uses a bundled glibc loader as PID1's executable; on
     # an ARM64 host binfmt QEMU is PID1's executable and the program is argv[1].
@@ -44,10 +50,12 @@ export async function readSlotProcessStatus({ projectRoot, vm, run = exec, timeo
   } catch {
     // Missing or unreadable config is unknown, never equivalent to disabled.
   }
-  if (vm.runtime?.type !== 'docker') return { ...unknown, telemetry: { enabled, running: null } }
+  const kvm = isKvmRuntime(vm)
+  if (vm.runtime?.type !== 'docker' && !kvm) return { ...unknown, telemetry: { enabled, running: null } }
+  const inSlot = (args) => (kvm ? kvmExecArgs(args) : args)
   try {
     const env = slotHost(vm).dockerEnv()
-    const { stdout } = await run('docker', ['exec', slotContainerName({ vm }), 'sh', '-c', PROBE], {
+    const { stdout } = await run('docker', inSlot(['exec', slotContainerName({ vm }), 'sh', '-c', PROBE]), {
       timeout: timeoutMs,
       maxBuffer: 4096,
       encoding: 'utf8',
@@ -78,19 +86,21 @@ export async function ensureTelemetrySidecar({ projectRoot, vm, run = exec, time
   }
   try {
     const env = slotHost(vm).dockerEnv()
-    await run(
-      'docker',
-      [
-        'exec',
-        '-d',
-        slotContainerName({ vm }),
-        '/usr/local/bin/kin-worker',
-        'telemetry',
-        '--config',
-        '/run/kin/worker.json',
-      ],
-      { timeout: timeoutMs, maxBuffer: 4096, encoding: 'utf8', ...(env ? { env } : {}) },
-    )
+    const args = [
+      'exec',
+      '-d',
+      slotContainerName({ vm }),
+      '/usr/local/bin/kin-worker',
+      'telemetry',
+      '--config',
+      '/run/kin/worker.json',
+    ]
+    await run('docker', isKvmRuntime(vm) ? kvmExecArgs(args) : args, {
+      timeout: timeoutMs,
+      maxBuffer: 4096,
+      encoding: 'utf8',
+      ...(env ? { env } : {}),
+    })
     return { ok: true, action: 'started' }
   } catch (error) {
     return { ok: false, action: 'start_failed', error: String(error?.message || error) }

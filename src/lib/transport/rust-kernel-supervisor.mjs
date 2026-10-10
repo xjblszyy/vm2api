@@ -33,14 +33,21 @@ import {
   replaceSlotOwnedFile,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { isKvmRuntime } from '../vm/runtime-kind.mjs'
+import { kvmExecArgs } from '../vm/kvm-runtime.mjs'
 
 const starts = new Map()
 
-/** Bind the VM's docker daemon into an injectable runner. */
+/**
+ * Bind the VM's docker daemon into an injectable runner. A KVM slot's
+ * `docker exec` is routed into the guest, so every probe below (kill -CHLD 1,
+ * pgrep, the dataplane sweep) sees the guest's processes, not the runner's.
+ */
 function slotRunner(exec, run) {
   const env = slotHost(exec?.vm).dockerEnv()
-  if (!env) return run
-  return (args, opts = {}) => run(args, { ...opts, env })
+  const kvm = isKvmRuntime(exec?.vm)
+  if (!env && !kvm) return run
+  return (args, opts = {}) => run(kvm ? kvmExecArgs(args) : args, env ? { ...opts, env } : opts)
 }
 const CONTAINER_KERNEL_BIN = '/home/kincli/.kin/kin-kernel'
 const CONTAINER_KERNEL_CONFIG = '/run/kin/kernel.json'
@@ -130,17 +137,17 @@ export async function reconcileCliHopRuntime(exec, { runDockerExec = runDocker }
 export function stopRustKernel(exec = {}) {
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
-  const result = spawnSync(
-    process.env.KIN_DOCKER_BIN || 'docker',
-    [
-      'exec',
-      container,
-      'sh',
-      '-lc',
-      'kill $(pidof kin-kernel) >/dev/null 2>&1 || true; kill $(pidof bun) >/dev/null 2>&1 || true',
-    ],
-    { encoding: 'utf8', timeout: 5000 },
-  )
+  const args = [
+    'exec',
+    container,
+    'sh',
+    '-lc',
+    'kill $(pidof kin-kernel) >/dev/null 2>&1 || true; kill $(pidof bun) >/dev/null 2>&1 || true',
+  ]
+  const result = spawnSync(process.env.KIN_DOCKER_BIN || 'docker', isKvmRuntime(exec?.vm) ? kvmExecArgs(args) : args, {
+    encoding: 'utf8',
+    timeout: 5000,
+  })
   return { ok: result.status === 0, code: result.status }
 }
 
@@ -483,7 +490,9 @@ export async function recycleWrapIfIdle(
   return rec
 }
 
-async function containerKernelIsPid1(container, runDockerExec) {
+async function containerKernelIsPid1(container, runDockerExec, vm) {
+  // The KVM guest's PID1 supervises kin-kernel: restart the slot, never exec a second one.
+  if (isKvmRuntime(vm)) return true
   const info = await runDockerExec(['inspect', '--format', '{{.Path}}', container], { timeoutMs: 3000 })
   return /kin-kernel/.test(String(info?.stdout || ''))
 }
@@ -532,7 +541,7 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied
-  const pid1Kernel = await containerKernelIsPid1(container, runDockerExec)
+  const pid1Kernel = await containerKernelIsPid1(container, runDockerExec, exec?.vm)
   const waitMs = force || staleWrap || slotMismatch ? 0 : bootWaitMs(timeoutMs, { pid1Kernel, wedged })
   if (waitMs > 0) {
     const waited = await waitForHealth(exec, waitMs)

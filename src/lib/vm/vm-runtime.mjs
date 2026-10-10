@@ -23,6 +23,7 @@ import { assertProxyAllowed } from './proxy-policy.mjs'
 import { toHostPath } from './host-path.mjs'
 import { fileURLToPath } from 'node:url'
 import { OS_CATALOG, OS_ORDER, imageForKernel, buildDirForKernel } from './os-catalog.mjs'
+import { kvmContainerMemory, kvmExecArgs, kvmImageForKernel, kvmRunArgs, kvmRunError } from './kvm-runtime.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -47,11 +48,18 @@ export function timezoneForIndex(i) {
   return US_TIMEZONES[(Number(i) - 1) % US_TIMEZONES.length]
 }
 
+/** Docker image for a slot: kin-os for containers, kin-vmm (guest rootfs inside) for KVM. */
+export function slotImageFor(vm, kernel = vm?.kernel) {
+  return runtimeKind(vm) === 'kvm' ? kvmImageForKernel(kernel) : imageForKernel(kernel)
+}
+
 /** Pull the guest image, falling back to the in-repo Dockerfile when the registry is unreachable. */
-export function ensureSlotImage(kernel, { run = sh, projectRoot } = {}) {
-  const image = imageForKernel(kernel)
+export function ensureSlotImage(kernel, { run = sh, projectRoot, kvm = false } = {}) {
+  const image = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
   if (run(['docker', 'image', 'inspect', image], { timeout: 10_000 }).ok) return { ok: true, action: 'present', image }
   if (run(['docker', 'pull', image], { timeout: 300_000 }).ok) return { ok: true, action: 'pulled', image }
+  // kin-vmm builds from the repo root (worker/ + docker/kin-vmm); there is no per-OS fallback context.
+  if (kvm) return { ok: false, code: 'kvm_image_missing', error: `KVM slot image ${image} not available` }
   const dir = path.join(projectRoot || MODULE_ROOT, 'docker', 'kin-os', buildDirForKernel(kernel))
   if (!fs.existsSync(path.join(dir, 'Dockerfile'))) {
     return { ok: false, error: `guest image ${image} not available and no build context at ${dir}` }
@@ -138,7 +146,9 @@ export function inspectContainer(name) {
 export function containerHasKernelMount(name) {
   const r = sh(['docker', 'inspect', '--format', '{{range .Mounts}}{{println .Destination}}{{end}}', name])
   if (!r.ok) return false
-  return r.stdout.split(/\s+/).includes('/usr/local/bin/kin-kernel')
+  const dests = r.stdout.split(/\s+/)
+  // A KVM runner mounts host bins under /opt/kin/bin; the guest links them into /usr/local/bin.
+  return dests.includes('/usr/local/bin/kin-kernel') || dests.includes('/opt/kin/bin/kin-kernel')
 }
 
 function vmWantsOuterSocks(vm) {
@@ -308,7 +318,7 @@ export function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
   const cmd = existing.running ? ['docker', 'restart', name] : ['docker', 'start', name]
   const r = sh(cmd, { timeout: 60_000 })
   if (!r.ok) return { ok: false, error: r.stderr || `${cmd.join(' ')} failed` }
-  startTelemetrySidecar(name)
+  startTelemetrySidecar(name, vm)
   runtimePatch(vm, inspectContainer(name), workerRuntimeExtra(worker))
   return { ok: true, action: existing.running ? 'reloaded' : 'started', runtime: vm.runtime }
 }
@@ -322,12 +332,30 @@ export function slotKernelAlive(existing, paths) {
   return fs.existsSync(paths.kernelSocket)
 }
 
+/**
+ * `docker exec` argv (without 'docker') for a slot. A KVM slot's command runs in
+ * the guest, not in the runner container that owns the name.
+ */
+export function slotExecArgs(vm, args) {
+  return runtimeKind(vm) === 'kvm' ? kvmExecArgs(args) : args
+}
+
 /** The telemetry sidecar is a docker exec child: every container (re)start loses it. */
-function startTelemetrySidecar(name) {
+function startTelemetrySidecar(name, vm) {
   if (!fs.existsSync(WORKER_BIN)) return
-  sh(['docker', 'exec', '-d', name, '/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], {
-    timeout: 8_000,
-  })
+  const args = ['exec', '-d', name, '/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json']
+  // A just-booted guest needs a moment before its exec port listens.
+  if (runtimeKind(vm) === 'kvm') waitForKvmGuest(name)
+  sh(['docker', ...slotExecArgs(vm, args)], { timeout: 8_000 })
+}
+
+function waitForKvmGuest(name, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (sh(['docker', ...kvmExecArgs(['exec', name, 'true'])], { timeout: 3_000 }).ok) return true
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200)
+  }
+  return false
 }
 
 function readProjectRouting(projectRoot) {
@@ -418,7 +446,8 @@ export function startVmRuntime(vm, projectRoot, { recreate = false, routing } = 
   const zone = validTimezone(vm.timezone)
   if (zone) vm.timezone = zone
   vm.locale = vm.locale || STANDARD_LOCALE
-  const image = imageForKernel(kernel)
+  const kvm = runtimeKind(vm) === 'kvm'
+  const image = slotImageFor(vm, kernel)
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   fs.mkdirSync(home, { recursive: true })
   ensureSlotClaudeOwnership(home, runtimeUidNum(vm), Number(GID))
@@ -471,12 +500,12 @@ export function startVmRuntime(vm, projectRoot, { recreate = false, routing } = 
   if (existing) {
     const r = sh(['docker', 'start', name])
     if (!r.ok) return { ok: false, error: r.stderr || 'docker start failed' }
-    startTelemetrySidecar(name)
+    startTelemetrySidecar(name, vm)
     runtimePatch(vm, inspectContainer(name), workerRuntimeExtra(worker))
     return { ok: true, action: 'started', runtime: vm.runtime }
   }
 
-  const img = ensureSlotImage(kernel, { projectRoot })
+  const img = ensureSlotImage(kernel, { projectRoot, kvm })
   if (!img.ok) return img
 
   try {
@@ -488,18 +517,95 @@ export function startVmRuntime(vm, projectRoot, { recreate = false, routing } = 
   const machineIdFile = ensureGuestMachineIdFile(projectRoot, vm)
   // Slots are created by the host engine: every -v source must be a host path.
   const hostOf = (p) => toHostPath(p, { projectRoot })
-  const machineMounts = machineIdFile
-    ? [
-        '-v',
-        `${hostOf(machineIdFile)}:/etc/machine-id:ro`,
-        '-v',
-        `${hostOf(machineIdFile)}:/var/lib/dbus/machine-id:ro`,
-      ]
-    : []
+  // A KVM guest gets its machine-id from guest.json; a bind-mount would only reach the runner.
+  const machineMounts =
+    machineIdFile && !kvm
+      ? [
+          '-v',
+          `${hostOf(machineIdFile)}:/etc/machine-id:ro`,
+          '-v',
+          `${hostOf(machineIdFile)}:/var/lib/dbus/machine-id:ro`,
+        ]
+      : []
   const netName = slotNetworkForVm(vm)
   if (!netName || netName === 'host' || netName === 'bridge') {
     return { ok: false, error: 'bound SOCKS5 network required; refusing host/bridge fallback' }
   }
+  const binMount = (bin, dest) => ['-v', `${hostOf(bin)}:${dest}:ro`]
+  // A Docker slot runs the kernel as its PID1 under the slot uid. A KVM slot's PID1
+  // is the root-owned runner; the slot uid applies inside the guest (KIN_VMM_USER).
+  const confinement = kvm
+    ? [
+        '--memory',
+        kvmContainerMemory(),
+        '--memory-swap',
+        kvmContainerMemory(),
+        '--pids-limit',
+        '256',
+        '--read-only',
+        '--tmpfs',
+        '/tmp:rw,noexec,nosuid,size=32m',
+        '--tmpfs',
+        '/run:rw,nosuid,size=16m',
+        '--security-opt',
+        'no-new-privileges',
+        '--cap-drop',
+        'ALL',
+        // virtiofsd serves the slot uid's files and narrows its own caps (SETPCAP);
+        // tap/iptables stay in the slot netns.
+        ...[
+          'CHOWN',
+          'DAC_OVERRIDE',
+          'DAC_READ_SEARCH',
+          'FOWNER',
+          'FSETID',
+          'SETUID',
+          'SETGID',
+          'MKNOD',
+          'SETPCAP',
+        ].flatMap((c) => ['--cap-add', c]),
+        ...kvmRunArgs(vm, {
+          hostname: host,
+          machineId: vm.fingerprint?.guest_machine_id,
+          uid: runtimeUidNum(vm),
+          gid: Number(GID),
+        }),
+        '-v',
+        `${hostOf(path.join(projectRoot, 'vms', vm.id, 'vmm'))}:/var/lib/kin-vmm`,
+        ...(fs.existsSync(WORKER_BIN) ? binMount(WORKER_BIN, '/opt/kin/bin/kin-worker') : []),
+        ...(mountKernel ? binMount(kernelBin, '/opt/kin/bin/kin-kernel') : []),
+      ]
+    : [
+        '--memory',
+        MEM,
+        '--memory-swap',
+        MEM,
+        '--pids-limit',
+        '256',
+        '--user',
+        runtimeUser(vm),
+        '--read-only',
+        '--tmpfs',
+        '/tmp:rw,noexec,nosuid,size=32m',
+        '--security-opt',
+        'no-new-privileges',
+        '--cap-drop',
+        'ALL',
+        ...(fs.existsSync(WORKER_BIN) ? binMount(WORKER_BIN, '/usr/local/bin/kin-worker') : []),
+        ...(mountKernel ? binMount(kernelBin, '/usr/local/bin/kin-kernel') : []),
+        ...machineMounts,
+      ]
+  // The KVM image's entrypoint is the runner; the guest starts the kernel itself.
+  const command = kvm
+    ? [image]
+    : [
+        image,
+        fs.existsSync(wrapKernel) ? '/home/kincli/.kin/kin-kernel' : '/usr/local/bin/kin-kernel',
+        '--gateway-worker',
+        '--config',
+        '/run/kin/kernel.json',
+      ]
+  if (kvm) fs.mkdirSync(path.join(projectRoot, 'vms', vm.id, 'vmm'), { recursive: true })
   const args = [
     'docker',
     'run',
@@ -512,21 +618,7 @@ export function startVmRuntime(vm, projectRoot, { recreate = false, routing } = 
     netName,
     '--restart',
     'unless-stopped',
-    '--memory',
-    MEM,
-    '--memory-swap',
-    MEM,
-    '--pids-limit',
-    '256',
-    '--user',
-    runtimeUser(vm),
-    '--read-only',
-    '--tmpfs',
-    '/tmp:rw,noexec,nosuid,size=32m',
-    '--security-opt',
-    'no-new-privileges',
-    '--cap-drop',
-    'ALL',
+    ...confinement,
     '--label',
     'kin.vm=1',
     '--label',
@@ -535,13 +627,12 @@ export function startVmRuntime(vm, projectRoot, { recreate = false, routing } = 
     `kin.vm.name=${slotName}`,
     '--label',
     `kin.vm.os=${kernel}`,
+    '--label',
+    `kin.vm.runtime=${kvm ? 'kvm' : 'docker'}`,
     '-v',
     `${hostOf(home)}:/home/kincli`,
     '-v',
     `${hostOf(worker.runDir)}:/run/kin`,
-    ...(fs.existsSync(WORKER_BIN) ? ['-v', `${hostOf(WORKER_BIN)}:/usr/local/bin/kin-worker:ro`] : []),
-    ...(mountKernel ? ['-v', `${hostOf(kernelBin)}:/usr/local/bin/kin-kernel:ro`] : []),
-    ...machineMounts,
     '-e',
     'HOME=/home/kincli',
     '-e',
@@ -564,20 +655,16 @@ export function startVmRuntime(vm, projectRoot, { recreate = false, routing } = 
     'use-vc',
     '-w',
     '/home/kincli',
-    image,
-    fs.existsSync(wrapKernel) ? '/home/kincli/.kin/kin-kernel' : '/usr/local/bin/kin-kernel',
-    '--gateway-worker',
-    '--config',
-    '/run/kin/kernel.json',
+    ...command,
   ]
 
   const r = sh(args, { timeout: 90_000 })
-  if (!r.ok) return { ok: false, error: r.stderr || r.stdout || 'docker run failed' }
+  if (!r.ok) return (kvm && kvmRunError(r.stderr)) || { ok: false, error: r.stderr || r.stdout || 'docker run failed' }
   runtimePatch(vm, inspectContainer(name), {
     container_id: r.stdout,
     ...workerRuntimeExtra(worker),
   })
-  startTelemetrySidecar(name)
+  startTelemetrySidecar(name, vm)
   return { ok: true, action: 'created', runtime: vm.runtime }
 }
 
