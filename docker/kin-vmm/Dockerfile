@@ -4,6 +4,20 @@
 #     -t ghcr.io/dofastted/kin-vmm-debian:12 -f docker/kin-vmm/Dockerfile .
 ARG OS_IMAGE=ghcr.io/dofastted/kin-os-debian:12
 
+# cloud-hypervisor from the pinned release tag plus docker/kin-vmm/patches
+# (per-slot SMBIOS BIOS identity). Static musl, like the upstream release binary.
+FROM rust:1.91-bookworm AS chbuild
+ARG CH_VERSION=v53.0
+ARG CH_COMMIT=9ed824d6d08df3e96f7d5f50795d9449ac99f431
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/* \
+ && rustup target add x86_64-unknown-linux-musl
+RUN git clone --depth 1 --branch "${CH_VERSION}" https://github.com/cloud-hypervisor/cloud-hypervisor.git /ch \
+ && test "$(git -C /ch rev-parse HEAD)" = "${CH_COMMIT}"
+COPY docker/kin-vmm/patches/ /patches/
+RUN cd /ch && for p in /patches/*.patch; do git apply "$p"; done \
+ && cargo build --release --locked --target x86_64-unknown-linux-musl --bin cloud-hypervisor --bin ch-remote \
+ && install -m 755 target/x86_64-unknown-linux-musl/release/cloud-hypervisor target/x86_64-unknown-linux-musl/release/ch-remote /usr/local/bin/
+
 FROM golang:1.25-bookworm AS guestbin
 WORKDIR /src
 COPY worker/go.mod worker/go.sum ./
@@ -34,22 +48,15 @@ RUN rm -f /rootfs/.dockerenv \
  && sha256sum /rootfs.ext4 | cut -d" " -f1 > /rootfs.id
 
 FROM debian:13
-ARG CH_VERSION=v53.0
-ARG CH_SHA256=448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc
-ARG CH_REMOTE_SHA256=13f32ba952e6791fd901f2279be2055fbacc64005f96c42a8e90d58860df84a7
 ARG KERNEL_RELEASE=ch-release-v7.2.8-20261009
 ARG KERNEL_SHA256=edfeb8a8a6c04ff2979e9f1c700feaa29b8f564f952261834ef0b7d2e673a853
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl iproute2 iptables virtiofsd \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /opt/kin-vmm \
- && curl -fsSL -o /opt/kin-vmm/cloud-hypervisor "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static" \
- && echo "${CH_SHA256}  /opt/kin-vmm/cloud-hypervisor" | sha256sum -c - \
- && curl -fsSL -o /opt/kin-vmm/ch-remote "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/ch-remote-static" \
- && echo "${CH_REMOTE_SHA256}  /opt/kin-vmm/ch-remote" | sha256sum -c - \
  && curl -fsSL -o /opt/kin-vmm/vmlinux "https://github.com/cloud-hypervisor/linux/releases/download/${KERNEL_RELEASE}/vmlinux-x86_64" \
- && echo "${KERNEL_SHA256}  /opt/kin-vmm/vmlinux" | sha256sum -c - \
- && chmod 755 /opt/kin-vmm/cloud-hypervisor /opt/kin-vmm/ch-remote
+ && echo "${KERNEL_SHA256}  /opt/kin-vmm/vmlinux" | sha256sum -c -
+COPY --from=chbuild /usr/local/bin/cloud-hypervisor /usr/local/bin/ch-remote /opt/kin-vmm/
 COPY --from=guestbin /out/kin-guest /usr/local/bin/kin-guest
 COPY --from=rootfs /rootfs.ext4 /rootfs.id /opt/kin-vmm/
 COPY docker/kin-vmm/start.sh /usr/local/bin/kin-vmm

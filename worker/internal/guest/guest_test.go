@@ -120,7 +120,7 @@ func TestExecStreamsOutputAndExitCode(t *testing.T) {
 		},
 	})
 	var out, errb bytes.Buffer
-	err := Exec(path, ExecRequest{Argv: []string{"echo", "hi"}, User: "10001:987", Stdin: true}, strings.NewReader("payload"), &out, &errb)
+	err := Exec(path, ExecRequest{Argv: []string{"echo", "hi"}, User: "10001:987", Stdin: true}, strings.NewReader("payload"), &out, &errb, nil)
 	var exit ExitError
 	if !errors.As(err, &exit) || exit.Code != 7 {
 		t.Fatalf("err = %v, want exit 7", err)
@@ -137,7 +137,7 @@ func TestExecWithoutExitFrameFails(t *testing.T) {
 			c.Close()
 		},
 	})
-	err := Exec(path, ExecRequest{Argv: []string{"true"}}, nil, io.Discard, io.Discard)
+	err := Exec(path, ExecRequest{Argv: []string{"true"}}, nil, io.Discard, io.Discard, nil)
 	if err == nil || errors.As(err, new(ExitError)) {
 		t.Fatalf("err = %v, want stream error", err)
 	}

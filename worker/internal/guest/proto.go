@@ -32,6 +32,11 @@ type ExecRequest struct {
 	Dir    string   `json:"dir,omitempty"`
 	Detach bool     `json:"detach,omitempty"`
 	Stdin  bool     `json:"stdin,omitempty"`
+	// TTY runs the command on a guest pseudo-terminal (docker exec -t).
+	// Output then arrives as FrameStdout only, and FrameResize carries the size.
+	TTY  bool   `json:"tty,omitempty"`
+	Rows uint16 `json:"rows,omitempty"`
+	Cols uint16 `json:"cols,omitempty"`
 }
 
 // Exec stream frames. Each frame is 1 type byte + 4 byte big-endian length + payload.
@@ -41,7 +46,23 @@ const (
 	FrameStderr byte = 2
 	FrameExit   byte = 3
 	FrameEOF    byte = 4
+	// FrameResize payload: rows and cols as two big-endian uint16.
+	FrameResize byte = 5
 )
+
+func ResizePayload(rows, cols uint16) []byte {
+	var b [4]byte
+	binary.BigEndian.PutUint16(b[0:], rows)
+	binary.BigEndian.PutUint16(b[2:], cols)
+	return b[:]
+}
+
+func ParseResize(p []byte) (rows, cols uint16, ok bool) {
+	if len(p) != 4 {
+		return 0, 0, false
+	}
+	return binary.BigEndian.Uint16(p[0:]), binary.BigEndian.Uint16(p[2:]), true
+}
 
 const maxFrame = 1 << 20
 

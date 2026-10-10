@@ -5,7 +5,10 @@
 #
 #   /run/kin      -> guest /run/kin (virtiofs "kinrun")
 #   /home/kincli  -> guest /home/kincli (virtiofs "kinhome")
-#   /opt/kin/bin  -> guest /opt/kin/bin, linked into /usr/local/bin (virtiofs "kinbin", ro)
+#   /opt/kin      -> guest /opt/kin (virtiofs "kinbin", ro): host-mounted or baked slot
+#                    binaries; /opt/kin/bin/* is linked into the guest's /usr/local/bin
+#   /home/kincli/.claude -> same path in the guest (virtiofs "kinclaude") when it is
+#                    its own bind mount here (cluster nodes nest it under the home)
 #   $DISK         -> guest root (per-slot copy, kept on the host across restarts)
 #   /run/kin/kernel.sock  served here by `kin-guest bridge` over vsock
 #   guest eth0 -> tap0 -> MASQUERADE -> container eth0 -> host kin-eg-* REDIRECT
@@ -37,14 +40,23 @@ if [ ! -f "$DISK" ] || ! cmp -s "$VMM/rootfs.id" "$DISK_DIR/rootfs.id"; then
   cp "$VMM/rootfs.id" "$DISK_DIR/rootfs.id"
 fi
 
+SHARES="kinrun:/run/kin kinhome:/home/kincli kinbin:/opt/kin"
+# A nested bind is invisible through the parent's virtiofs share; export it on its own.
+EXTRA_MOUNTS=""
+if mountpoint -q /home/kincli/.claude 2>/dev/null; then
+  SHARES="$SHARES kinclaude:/home/kincli/.claude"
+  EXTRA_MOUNTS='{"tag": "kinclaude", "path": "/home/kincli/.claude"}'
+fi
 FS_PIDS=""
-for share in kinrun:/run/kin kinhome:/home/kincli kinbin:/opt/kin/bin; do
+FS_ARGS=""
+for share in $SHARES; do
   tag=${share%%:*}
   dir=${share#*:}
   # The slot container has no CAP_SETFCAP; virtiofsd must not ask to keep it.
   /usr/libexec/virtiofsd --socket-path="$STATE/$tag.sock" --shared-dir="$dir" \
     --sandbox=none --modcaps=-setfcap --cache=auto --inode-file-handles=never --xattr --log-level=error &
   FS_PIDS="$FS_PIDS $tag:$!"
+  FS_ARGS="$FS_ARGS tag=$tag,socket=$STATE/$tag.sock"
 done
 
 # docker restart keeps the netns: tap0 and the nat rules may already exist.
@@ -64,7 +76,8 @@ cat > /run/kin/guest.json <<EOF
   "dns": ["${KIN_VMM_DNS:-8.8.8.8}"],
   "user": "$GUEST_USER",
   "env": ["TZ=${TZ:-UTC}", "LANG=${LANG:-en_US.UTF-8}", "KIN_VM_ID=${KIN_VM_ID:-}", "KIN_VM_OS=${KIN_VM_OS:-}"],
-  "kernel": ${KIN_VMM_KERNEL:-true}
+  "kernel": ${KIN_VMM_KERNEL:-true},
+  "mounts": [${EXTRA_MOUNTS}]
 }
 EOF
 
@@ -106,7 +119,7 @@ trap 'log "stopping guest"; kin-guest poweroff --vsock "$STATE/vsock.sock" || ki
   --disk "path=$DISK,image_type=raw" \
   --cpus "boot=$CPUS" \
   --memory "size=${MEM}M,shared=on" \
-  --fs "tag=kinrun,socket=$STATE/kinrun.sock" "tag=kinhome,socket=$STATE/kinhome.sock" "tag=kinbin,socket=$STATE/kinbin.sock" \
+  --fs $FS_ARGS \
   --net "tap=$TAP,mac=${KIN_VMM_MAC:-52:54:00:12:34:56}" \
   --vsock "cid=3,socket=$STATE/vsock.sock" \
   ${PLATFORM:+--platform "$PLATFORM"} \

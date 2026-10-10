@@ -105,11 +105,11 @@ export function awaitSlotImageBuild(job) {
  * Build the self-contained slot image on the node. One job per node+kernel;
  * a second call while running returns the running job.
  */
-export function startSlotImageBuild(nodeId, kernel) {
-  const key = `${nodeId}:${kernel}`
+export function startSlotImageBuild(nodeId, kernel, { kvm = false } = {}) {
+  const key = `${nodeId}:${kernel}${kvm ? ':kvm' : ''}`
   const current = imageJobs.get(key)
   if (current?.status === 'running') return current
-  const spec = slotImageSpec(state().projectRoot, kernel)
+  const spec = slotImageSpec(state().projectRoot, kernel, { kvm })
   const client = clusterManager().client(nodeId)
   const job = {
     status: 'running',

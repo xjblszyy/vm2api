@@ -49,7 +49,7 @@ import { atomicWriteJson, listVmRecordFiles } from '../vm/vm-file.mjs'
 import { CONTAINER_CLI_NODE_BIN, normalizeOfficialCcInference, resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
-import { isKvmRuntime } from '../vm/runtime-kind.mjs'
+import { kvmExecArgs } from '../vm/kvm-runtime.mjs'
 
 export { officialCcUidGid } from '../vm/vm-runtime.mjs'
 export const DEFAULT_HELLO_PROMPT = 'hello'
@@ -181,6 +181,8 @@ export function chooseIdleMemory(current, initMemory, fallback = slotIdleMemory(
 }
 
 export function inspectContainerMemory(vmId) {
+  // Guest RAM is fixed at boot; the runner's limit is not the CLI's memory.
+  if (slotIsKvm(vmId)) return null
   const r = sh(['docker', 'inspect', '-f', '{{.HostConfig.Memory}}', containerName(vmId)], { timeout: 10_000 })
   if (!r.ok) return null
   return formatMemoryLimit(String(r.stdout || '').trim())
@@ -190,6 +192,8 @@ export function applyContainerMemory(vmId, memory) {
   const mem = String(memory || slotIdleMemory())
     .trim()
     .toLowerCase()
+  // Shrinking a KVM runner below its guest would OOM-kill the VMM.
+  if (slotIsKvm(vmId)) return { ok: true, skipped: true, reason: 'kvm_fixed_memory' }
   return sh(['docker', 'update', '--memory', mem, '--memory-swap', mem, containerName(vmId)], { timeout: 15_000 })
 }
 
@@ -198,6 +202,22 @@ export function applyContainerMemory(vmId, memory) {
  * kernel's native CLI, so neither a path nor a pkill pattern can tell them apart.
  */
 const OFFICIAL_CC_MARKER = 'KIN_OFFICIAL_CC=1'
+
+/**
+ * A KVM slot's container is the runner; the CLI lives in its guest. Read the
+ * label the slot was created with so callers that only hold a vmId route right.
+ */
+export function slotIsKvm(vmId) {
+  const r = sh(['docker', 'inspect', '-f', '{{index .Config.Labels "kin.vm.runtime"}}', containerName(vmId)], {
+    timeout: 10_000,
+  })
+  return r.ok && r.stdout === 'kvm'
+}
+
+/** `docker exec` argv (no leading 'docker') that runs in the slot's guest when it is KVM. */
+export function officialCcExecArgs(vmId, args, kvm = slotIsKvm(vmId)) {
+  return kvm ? kvmExecArgs(args) : args
+}
 
 function officialCcMarkedPidsScript(action) {
   return `for d in /proc/[0-9]*; do tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qx '${OFFICIAL_CC_MARKER}' || continue; ${action}; done; exit 0`
@@ -208,13 +228,15 @@ export function stopOfficialCcLeftovers(vmId) {
   return sh(
     [
       'docker',
-      'exec',
-      '-u',
-      '0',
-      containerName(vmId),
-      'sh',
-      '-c',
-      officialCcMarkedPidsScript('kill "${d#/proc/}" 2>/dev/null'),
+      ...officialCcExecArgs(vmId, [
+        'exec',
+        '-u',
+        '0',
+        containerName(vmId),
+        'sh',
+        '-c',
+        officialCcMarkedPidsScript('kill "${d#/proc/}" 2>/dev/null'),
+      ]),
     ],
     {
       timeout: 10_000,
@@ -270,7 +292,16 @@ export function stopOfficialCcResident(vmId, projectRoot) {
 
 export function inspectOfficialCcResident(vmId) {
   const r = sh(
-    ['docker', 'exec', containerName(vmId), 'sh', '-c', officialCcMarkedPidsScript('echo "${d#/proc/}"; exit 0')],
+    [
+      'docker',
+      ...officialCcExecArgs(vmId, [
+        'exec',
+        containerName(vmId),
+        'sh',
+        '-c',
+        officialCcMarkedPidsScript('echo "${d#/proc/}"; exit 0'),
+      ]),
+    ],
     { timeout: 8_000 },
   )
   const pid = Number(String(r.stdout || '').trim())
@@ -308,6 +339,8 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
     env: {
       ...process.env,
       KIN_CONTAINER: containerName(vmId),
+      // KVM: the script runs `docker exec -it <c> kin-guest exec ... -i -t`; see kvmExecArgs.
+      KIN_SLOT_KVM: slotIsKvm(vmId) ? '1' : '',
       KIN_UID: String(uid),
       KIN_GID: String(gid),
       KIN_CLI_BIN: CONTAINER_CLI_NODE_BIN,
@@ -852,15 +885,18 @@ export async function runOfficialCcTurn({
   const err = fs.openSync(errFile, 'w', 0o600)
   const child = spawn(
     'docker',
-    buildOfficialCcDockerArgs({
+    officialCcExecArgs(
       vmId,
-      uid,
-      gid,
-      timezone,
-      locale,
-      bridgeUrl,
-      prompt,
-    }),
+      buildOfficialCcDockerArgs({
+        vmId,
+        uid,
+        gid,
+        timezone,
+        locale,
+        bridgeUrl,
+        prompt,
+      }),
+    ),
     { stdio: ['ignore', out, err] },
   )
   const finished = await waitExit(child, timeoutMs)
@@ -1065,15 +1101,6 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
   const startedAt = new Date().toISOString()
   if (!canOfficialCc(credentialModeOfVm(vm))) {
     return { ok: false, error: 'official Claude Code init requires full OAuth' }
-  }
-  // The bootstrap drives a PTY CLI through docker exec and resizes the container's
-  // memory; a KVM guest has neither. Import credentials or use the OAuth flow instead.
-  if (isKvmRuntime(vm)) {
-    return {
-      ok: false,
-      code: 'kvm_official_cc_unsupported',
-      error: 'official Claude Code init is not supported on KVM slots yet',
-    }
   }
   if (!(hasAccessPresence(vm.claude) || hasRefreshPresence(vm.claude))) {
     const credFile = path.join(homeDir, '.claude', 'credentials.json')

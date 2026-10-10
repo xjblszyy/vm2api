@@ -2,6 +2,7 @@
 """Keep the slot cli-node attached after init hello.
 
 Host PTY + `docker exec -it` so the CLI stays in an interactive session.
+A KVM slot (KIN_SLOT_KVM=1) gets the same session on a guest PTY via kin-guest.
 Does not print credentials. Exits when the guest CLI process exits.
 """
 from __future__ import annotations
@@ -47,7 +48,28 @@ def main() -> int:
         container,
         cli,
     ]
+    if os.environ.get("KIN_SLOT_KVM") == "1":
+        argv = kvm_exec(argv)
     return pty.spawn(argv) or 0
+
+
+def kvm_exec(argv: list[str]) -> list[str]:
+    """Run inside a KVM slot's guest: same shape as kvmExecArgs in kvm-runtime.mjs."""
+    i = argv.index("exec") + 1
+    flags: list[str] = []
+    while argv[i].startswith("-"):
+        flag = argv[i]
+        if flag in ("-u", "-e", "-w"):
+            flags += [flag, argv[i + 1]]
+            i += 2
+        else:
+            i += 1  # -it: docker keeps its tty, the guest gets -i -t below
+    container, cmd = argv[i], argv[i + 1:]
+    return [
+        "docker", "exec", "-i", "-t", container,
+        "kin-guest", "exec", "--vsock", "/run/kin-vmm/vsock.sock", "-i", "-t",
+        *flags, "--", *cmd,
+    ]
 
 
 if __name__ == "__main__":

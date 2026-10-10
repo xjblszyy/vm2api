@@ -1,8 +1,8 @@
 /**
  * Host-side slot lifecycle. A KVM slot is the same Docker container running
- * the kin-vmm image (see kvm-runtime.mjs), so it shares every path here; only
- * cluster nodes refuse it until node KVM capability is reported. Guest
- * identity / SOCKS / TLS stay inside the rust kernel and must not branch here.
+ * the kin-vmm image (see kvm-runtime.mjs), locally or on a cluster node, so it
+ * shares every path here. Guest identity / SOCKS / TLS stay inside the rust
+ * kernel and must not branch here.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -13,7 +13,7 @@ import {
   writeKernelConfig,
 } from '../transport/rust-kernel-supervisor.mjs'
 import { ensureCodexKernel, stopCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
-import { runtimeKind, RUNTIME_KVM } from './runtime-kind.mjs'
+import { runtimeKind } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
 import { resolveInferenceEngine } from './slot-engine.mjs'
 import {
@@ -29,25 +29,11 @@ import { slotHost } from './slot-host.mjs'
 
 export { runtimeKind }
 
-// Cluster nodes do not report /dev/kvm yet; a KVM slot runs on the control-plane host only.
-function kvmRefuse(vm, action) {
-  if (runtimeKind(vm) !== RUNTIME_KVM || slotHost(vm).kind === 'local') return null
-  return {
-    ok: false,
-    code: 'kvm_remote_unsupported',
-    error: '集群节点上的槽位暂不支持 KVM',
-    action,
-    runtime: RUNTIME_KVM,
-  }
-}
-
 function unsupportedOnHost(action) {
   return { ok: false, code: 'remote_unsupported', error: `集群节点上的槽位不支持：${action}` }
 }
 
 export function startSlot(vm, projectRoot, opts = {}) {
-  const refused = kvmRefuse(vm, 'start')
-  if (refused) return refused
   return slotHost(vm).start(vm, projectRoot, opts)
 }
 
@@ -76,8 +62,6 @@ export async function destroySlot(vm) {
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Never docker rm. */
 export async function reloadSlot(vm, projectRoot, opts = {}) {
-  const refused = kvmRefuse(vm, 'reload')
-  if (refused) return refused
   return slotHost(vm).reload(vm, projectRoot, opts)
 }
 
@@ -139,8 +123,6 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   if (!slotHasCredential(vm, projectRoot)) {
     return { ok: true, skipped: true, reason: 'no_credential', engine: 'rust' }
   }
-  const refused = kvmRefuse(vm, 'ensure-rust')
-  if (refused) return refused
   // A baked slot image ships kernel and CLIs; there is no .kin to materialize or kernel to mount.
   if (!slotHost(vm).bakedKernel) {
     const dest = wrapCliHomeDir(projectRoot, vm.id)

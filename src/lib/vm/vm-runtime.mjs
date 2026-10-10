@@ -23,7 +23,14 @@ import { assertProxyAllowed } from './proxy-policy.mjs'
 import { toHostPath } from './host-path.mjs'
 import { fileURLToPath } from 'node:url'
 import { OS_CATALOG, OS_ORDER, imageForKernel, buildDirForKernel } from './os-catalog.mjs'
-import { kvmContainerMemory, kvmExecArgs, kvmImageForKernel, kvmRunArgs, kvmRunError } from './kvm-runtime.mjs'
+import {
+  KVM_RUNNER_CAPS,
+  kvmContainerMemory,
+  kvmExecArgs,
+  kvmImageForKernel,
+  kvmRunArgs,
+  kvmRunError,
+} from './kvm-runtime.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -551,19 +558,7 @@ export function startVmRuntime(vm, projectRoot, { recreate = false, routing } = 
         'no-new-privileges',
         '--cap-drop',
         'ALL',
-        // virtiofsd serves the slot uid's files and narrows its own caps (SETPCAP);
-        // tap/iptables stay in the slot netns.
-        ...[
-          'CHOWN',
-          'DAC_OVERRIDE',
-          'DAC_READ_SEARCH',
-          'FOWNER',
-          'FSETID',
-          'SETUID',
-          'SETGID',
-          'MKNOD',
-          'SETPCAP',
-        ].flatMap((c) => ['--cap-add', c]),
+        ...KVM_RUNNER_CAPS.flatMap((c) => ['--cap-add', c]),
         ...kvmRunArgs(vm, {
           hostname: host,
           machineId: vm.fingerprint?.guest_machine_id,

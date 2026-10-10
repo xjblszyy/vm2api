@@ -15,6 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { OS_CATALOG, imageForKernel } from '../vm/os-catalog.mjs'
+import { kvmImageForKernel } from '../vm/kvm-runtime.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import {
   describeKernelPayload,
@@ -104,11 +105,16 @@ function fileDigest(file) {
   return digest
 }
 
-export function slotDockerfile(baseImage) {
+/**
+ * A container slot gets the binaries in place. A KVM runner keeps them under
+ * /opt/kin, which it shares into the guest; the guest links /opt/kin/bin into
+ * /usr/local/bin, so exec callers see the same paths either way.
+ */
+export function slotDockerfile(baseImage, { kvm = false } = {}) {
   return [
     `FROM ${baseImage}`,
     'COPY opt/kin/ /opt/kin/',
-    'COPY usr/local/bin/ /usr/local/bin/',
+    kvm ? 'COPY usr/local/bin/ /opt/kin/bin/' : 'COPY usr/local/bin/ /usr/local/bin/',
     'LABEL kin.slot.full=1',
     '',
   ].join('\n')
@@ -119,21 +125,25 @@ export function slotDockerfile(baseImage) {
  * vm2api/kin-slot-<kernel>:<hash12>. Content only — a release that leaves the
  * slot binaries alone must not orphan every node's image and stop its slots.
  */
-export function slotImageSpec(projectRoot, kernel) {
+export function slotImageSpec(projectRoot, kernel, { kvm = false } = {}) {
   if (!OS_CATALOG[kernel]) throw new ClusterError(400, 'invalid_kernel', `未知系统：${kernel}`)
-  const base = imageForKernel(kernel)
+  const base = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
   const files = slotPayload(projectRoot)
   const hash = crypto.createHash('sha256')
-  hash.update(slotDockerfile(base))
+  hash.update(slotDockerfile(base, { kvm }))
   for (const f of files) {
     hash.update(`${f.name}\0${f.mode}\0`)
     hash.update(f.body ? crypto.createHash('sha256').update(f.body).digest('hex') : fileDigest(f.src))
   }
   const digest = hash.digest('hex').slice(0, 12)
-  return { ref: `vm2api/kin-slot-${kernel}:${digest}`, base, hash: digest, files }
+  const name = kvm ? `kin-slot-vmm-${kernel}` : `kin-slot-${kernel}`
+  return { ref: `vm2api/${name}:${digest}`, base, hash: digest, files, kvm }
 }
 
 export function slotBuildContext(spec) {
-  const entries = [{ name: 'Dockerfile', body: Buffer.from(slotDockerfile(spec.base)), mode: 0o644 }, ...spec.files]
+  const entries = [
+    { name: 'Dockerfile', body: Buffer.from(slotDockerfile(spec.base, { kvm: spec.kvm })), mode: 0o644 },
+    ...spec.files,
+  ]
   return tarStream(entries).pipe(zlib.createGzip({ level: 6 }))
 }

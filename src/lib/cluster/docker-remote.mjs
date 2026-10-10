@@ -361,6 +361,23 @@ export async function execDetached(connect, id, cmd, { user } = {}) {
   await dockerJson(connect, { method: 'POST', path: `/exec/${created.Id}/start`, body: { Detach: true } }, [200])
 }
 
+/** Run cmd detached, poll until it exits; resolves to its exit code (null on timeout). */
+export async function execExitCode(connect, id, cmd, { timeoutMs = 10_000 } = {}) {
+  const created = await dockerJson(
+    connect,
+    { method: 'POST', path: `${containerPath(id)}/exec`, body: { Cmd: cmd, AttachStdout: false, AttachStderr: false } },
+    [201],
+  )
+  await dockerJson(connect, { method: 'POST', path: `/exec/${created.Id}/start`, body: { Detach: true } }, [200])
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const info = await inspectExec(connect, created.Id)
+    if (!info?.Running) return info?.ExitCode ?? null
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  return null
+}
+
 const EXEC_ID_RE = /^[a-f0-9]{64}$/
 
 function execPath(execId) {

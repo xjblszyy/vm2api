@@ -2,7 +2,7 @@
 //
 //	kin-guest init                      guest PID1 (kernel cmdline init=)
 //	kin-guest bridge --listen P --vsock S   runner: run/kernel.sock -> guest kernel
-//	kin-guest exec --vsock S [-u U] [-e K=V] [-w DIR] [-d] [-i] -- argv...
+//	kin-guest exec --vsock S [-u U] [-e K=V] [-w DIR] [-d] [-i] [-t] -- argv...
 //	                                     runner: `docker exec` into the guest
 //	kin-guest poweroff --vsock S         runner: clean guest shutdown on docker stop
 package main
@@ -80,6 +80,7 @@ func runExec(args []string) int {
 	dir := fs.String("w", "", "working directory")
 	detach := fs.Bool("d", false, "detach")
 	interactive := fs.Bool("i", false, "forward stdin")
+	tty := fs.Bool("t", false, "allocate a guest pseudo-terminal")
 	var env multiFlag
 	fs.Var(&env, "e", "KEY=VALUE (repeatable)")
 	_ = fs.Parse(args)
@@ -88,8 +89,31 @@ func runExec(args []string) int {
 		fmt.Fprintln(os.Stderr, "kin-guest exec: command required")
 		return 125
 	}
-	req := guest.ExecRequest{Argv: argv, Env: env, User: *user, Dir: *dir, Detach: *detach, Stdin: *interactive}
-	err := guest.Exec(*vsock, req, os.Stdin, os.Stdout, os.Stderr)
+	req := guest.ExecRequest{Argv: argv, Env: env, User: *user, Dir: *dir, Detach: *detach, Stdin: *interactive, TTY: *tty}
+	var resize chan [2]uint16
+	if *tty {
+		// Like docker exec -t: a local terminal goes raw and its size follows SIGWINCH.
+		if rows, cols, ok := guest.TermSize(os.Stdin); ok {
+			req.Rows, req.Cols = rows, cols
+			if restore, err := guest.MakeRaw(os.Stdin); err == nil {
+				defer restore()
+			}
+			resize = make(chan [2]uint16, 1)
+			winch := make(chan os.Signal, 1)
+			guest.NotifyResize(winch)
+			go func() {
+				for range winch {
+					if r, c, ok := guest.TermSize(os.Stdin); ok {
+						select {
+						case resize <- [2]uint16{r, c}:
+						default:
+						}
+					}
+				}
+			}()
+		}
+	}
+	err := guest.Exec(*vsock, req, os.Stdin, os.Stdout, os.Stderr, resize)
 	var exit guest.ExitError
 	switch {
 	case err == nil:

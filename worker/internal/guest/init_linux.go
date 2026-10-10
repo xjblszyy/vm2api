@@ -31,8 +31,10 @@ const (
 	GuestKernelCfg  = "/run/kin-guest/kernel.json"
 	GuestKernelSock = "/run/kin-guest/kernel.sock"
 	GuestBootFile   = "/run/kin/guest.json"
+	HostKinDir      = "/opt/kin"
 	HostBinDir      = "/opt/kin/bin"
 	wrapKernel      = "/home/kincli/.kin/kin-kernel"
+	imageKernel     = "/opt/kin/kin-kernel"
 	bakedKernel     = "/usr/local/bin/kin-kernel"
 )
 
@@ -46,6 +48,13 @@ type Boot struct {
 	User      string   `json:"user"`
 	Env       []string `json:"env"`
 	Kernel    bool     `json:"kernel"`
+	// Mounts are extra virtiofs shares (nested binds the runner exported separately).
+	Mounts []Mount `json:"mounts"`
+}
+
+type Mount struct {
+	Tag  string `json:"tag"`
+	Path string `json:"path"`
 }
 
 type mountSpec struct {
@@ -70,7 +79,7 @@ func RunInit() error {
 		{"cgroup2", "/sys/fs/cgroup", "cgroup2", "", unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC},
 		{"kinrun", SharedRunDir, "virtiofs", "", unix.MS_NOSUID | unix.MS_NODEV},
 		{"kinhome", "/home/kincli", "virtiofs", "", unix.MS_NOSUID | unix.MS_NODEV},
-		{"kinbin", HostBinDir, "virtiofs", "", unix.MS_NOSUID | unix.MS_NODEV | unix.MS_RDONLY},
+		{"kinbin", HostKinDir, "virtiofs", "", unix.MS_NOSUID | unix.MS_NODEV | unix.MS_RDONLY},
 	} {
 		if err := mountOne(m); err != nil {
 			// /run/kin and the home are the slot: without them there is nothing to serve.
@@ -87,6 +96,11 @@ func RunInit() error {
 	boot, err := readBoot(GuestBootFile)
 	if err != nil {
 		return err
+	}
+	for _, m := range boot.Mounts {
+		if err = mountOne(mountSpec{m.Tag, m.Path, "virtiofs", "", unix.MS_NOSUID | unix.MS_NODEV}); err != nil {
+			return err
+		}
 	}
 	if err = applyIdentity(boot); err != nil {
 		return err
@@ -235,9 +249,13 @@ func reapLoop(ctx context.Context) {
 
 // --- kernel supervision ------------------------------------------------------
 
+// kernelBinary: the slot home's wrap kernel, else one baked into the runner image
+// (cluster nodes), else a host-mounted binary.
 func kernelBinary() string {
-	if st, err := os.Stat(wrapKernel); err == nil && st.Mode()&0o111 != 0 {
-		return wrapKernel
+	for _, p := range []string{wrapKernel, imageKernel} {
+		if st, err := os.Stat(p); err == nil && st.Mode()&0o111 != 0 {
+			return p
+		}
 	}
 	return bakedKernel
 }
@@ -452,18 +470,6 @@ func pipe(a, b net.Conn) {
 
 // --- exec --------------------------------------------------------------------
 
-// frameSink serializes whole frames from the stdout and stderr goroutines.
-type frameSink struct {
-	mu sync.Mutex
-	w  io.Writer
-}
-
-func (s *frameSink) frame(kind byte, p []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return WriteFrame(s.w, kind, p)
-}
-
 type frameWriter struct {
 	sink *frameSink
 	kind byte
@@ -513,6 +519,11 @@ func serveExec(c net.Conn, boot Boot) {
 		return
 	}
 	cmd.Stdout, cmd.Stderr = frameWriter{sink: sink, kind: FrameStdout}, errw
+	if req.TTY {
+		code := runTTY(cmd, r, sink, req)
+		_ = sink.frame(FrameExit, []byte(strconv.Itoa(code)))
+		return
+	}
 	if req.Stdin {
 		stdin, perr := cmd.StdinPipe()
 		if perr == nil {
@@ -543,4 +554,87 @@ func serveExec(c net.Conn, boot Boot) {
 		}
 	}
 	_ = sink.frame(FrameExit, []byte(strconv.Itoa(code)))
+}
+
+// runTTY runs cmd as a session leader on a fresh guest PTY. The master side is
+// the whole stream: stdout frames out, stdin and resize frames in.
+func runTTY(cmd *exec.Cmd, r io.Reader, sink *frameSink, req ExecRequest) int {
+	master, slave, err := openPTY()
+	if err != nil {
+		_ = sink.frame(FrameStderr, []byte("pty: "+err.Error()+"\n"))
+		return 126
+	}
+	defer master.Close()
+	setWinsize(master, req.Rows, req.Cols)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+	attr := cmd.SysProcAttr
+	attr.Setpgid = false
+	attr.Setsid = true
+	attr.Setctty = true
+	attr.Ctty = 0 // index into the child's fds: stdin is the slave
+	if cmd.Env != nil && !hasEnv(cmd.Env, "TERM") {
+		cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+	}
+	if err = cmd.Start(); err != nil {
+		slave.Close()
+		_ = sink.frame(FrameStderr, []byte(err.Error()+"\n"))
+		return 127
+	}
+	slave.Close()
+	go func() {
+		for {
+			kind, buf, ferr := ReadFrame(r)
+			if ferr != nil {
+				return
+			}
+			switch kind {
+			case FrameStdin:
+				if _, werr := master.Write(buf); werr != nil {
+					return
+				}
+			case FrameResize:
+				if rows, cols, ok := ParseResize(buf); ok {
+					setWinsize(master, rows, cols)
+				}
+			case FrameEOF:
+				// ^D on the terminal is the in-band EOF; nothing to close here.
+			}
+		}
+	}()
+	out := make(chan struct{})
+	go func() {
+		defer close(out)
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := master.Read(buf)
+			if n > 0 {
+				if sink.frame(FrameStdout, buf[:n]) != nil {
+					return
+				}
+			}
+			if rerr != nil {
+				return // EIO once the last slave fd closes
+			}
+		}
+	}()
+	err = cmd.Wait()
+	<-out
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return 0
+	case errors.As(err, &ee):
+		return ee.ExitCode()
+	default:
+		return 127
+	}
+}
+
+func hasEnv(env []string, key string) bool {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			return true
+		}
+	}
+	return false
 }

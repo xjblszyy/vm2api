@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- KVM 槽位：`vm.runtime.type = "kvm"` 的槽仍是同名 Docker 容器、同一 `kin-eg-*` 网络，镜像换成 `kin-vmm-<os>`，容器内用 cloud-hypervisor v53 起微虚拟机，客户机内核独立（`uname` 不再是宿主内核）。`/run/kin`、`/home/kincli` 经 virtiofs 共享，`run/kernel.sock` 由运行器经 vsock 桥进客户机，控制面拨号方式不变；`docker exec` 统一改写进客户机。出口仍由宿主网桥的 kin-egress 转 SOCKS5、`FORWARD DROP` 兜底，宿主不加新规则。DMI 厂商 / 型号 / 序列号 / UUID 与 MAC 按槽派生，随指纹重置轮换。新增 Go 二进制 `kin-guest`（客户机 PID1 / kernel.sock 桥 / exec 通道），新增 `guest-images` 的 `vmm` 任务构建 `kin-vmm-*` 镜像。需要宿主 `/dev/kvm`；集群节点与官方 CC 初始化暂不支持，分别返回 `kvm_remote_unsupported`、`kvm_official_cc_unsupported`。见 [docs/KVM.md](docs/KVM.md)。
+- KVM 槽位：`vm.runtime.type = "kvm"` 的槽仍是同名 Docker 容器、同一 `kin-eg-*` 网络，镜像换成 `kin-vmm-<os>`，容器内用 cloud-hypervisor v53 起微虚拟机，客户机内核独立（`uname` 不再是宿主内核）。`/run/kin`、`/home/kincli`、`/opt/kin` 经 virtiofs 共享，`run/kernel.sock` 由运行器经 vsock 桥进客户机，控制面拨号方式不变；`docker exec`（含 `-it`，客户机分配真实 PTY）统一改写进客户机。出口仍由宿主网桥的 kin-egress 转 SOCKS5、`FORWARD DROP` 兜底，宿主不加新规则。DMI 厂商 / 型号 / 序列号 / UUID、BIOS 厂商 / 版本 / 日期与 MAC 按槽派生，随指纹重置轮换；cloud-hypervisor 改为源码编译并打补丁，BIOS 不再报 `cloud-hypervisor`，SMBIOS 虚拟机位清零。新增 Go 二进制 `kin-guest`（客户机 PID1 / kernel.sock 桥 / exec 与 PTY 通道），新增 `guest-images` 的 `vmm` 任务构建 `kin-vmm-*` 镜像。见 [docs/KVM.md](docs/KVM.md)。
+- KVM 槽支持集群节点：节点本机构建 `kin-slot-vmm-<os>`（二进制烤进 `/opt/kin`），经 Engine API 创建；节点单独绑的 `~/.claude` 以第四个 virtiofs 共享进客户机。官方 Claude Code 初始化与常驻会话在 KVM 槽里可用，内存调整跳过（客户机内存开机固定）。
+- 控制台「新建虚拟机」增加「隔离：容器 / KVM 虚拟机」（仅 Claude 槽）。新增 `GET /api/panel/vms/kvm-capability?kernel=&node_id=`，向目标宿主的 Docker 确认 `/dev/kvm`、镜像与架构；创建 KVM 槽前同样检查，不可用返回 409（`kvm_unavailable` / `kvm_image_missing` / `kvm_arch_unsupported`）。ARM64 宿主不支持 KVM 槽。
 
-已部署机升级：更新 Node 控制面，重启一次 Node。现有 Docker 槽不受影响；无迁移。要用 KVM 槽需先拉取 `kin-vmm-<os>` 镜像，并确认宿主 `/dev/kvm` 可用。
+已部署机升级：更新 Node 控制面、`web/dist`，重启一次 Node。现有 Docker 槽不受影响；无迁移。要用 KVM 槽需在本机或节点拉取 `kin-vmm-<os>` 镜像，并确认宿主 `/dev/kvm` 可用。
 
 ## 1.3.135 — 2026-10-09
 
