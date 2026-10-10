@@ -2,6 +2,7 @@
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
  * envelopes are unchanged; slot start/reload go through startSlotReady.
  */
+import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import {
@@ -176,6 +177,7 @@ import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
 import { preflightNode } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
+import { probeKvmCapability } from '../vm/kvm-runtime.mjs'
 import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
 import { writeSlotSeedFiles } from '../vm/slot-seed.mjs'
 import {
@@ -227,6 +229,25 @@ import {
   normalizeDimension,
   normalizeRange,
 } from '../db/repos/statistics-repo.mjs'
+
+/** Ask the daemon that would host the slot (this host or a node) whether it can run KVM. */
+function kvmCapabilityFor({ kernel, nodeId }) {
+  const host = slotHost(nodeId ? { node_id: nodeId } : {})
+  return probeKvmCapability({ kernel, env: host.dockerEnv(), key: nodeId || 'local', run: runDockerAsync })
+}
+
+// Async on purpose: a node's DOCKER_HOST is the SSH bridge this process serves.
+function runDockerAsync(argv, { timeout = 30_000, env } = {}) {
+  return new Promise((resolve) => {
+    execFile(argv[0], argv.slice(1), { encoding: 'utf8', timeout, ...(env ? { env } : {}) }, (err, stdout, stderr) =>
+      resolve({
+        ok: !err,
+        stdout: String(stdout || '').trim(),
+        stderr: String(stderr || err?.message || '').trim(),
+      }),
+    )
+  })
+}
 
 /** Tenants always see their own rows; other roles may narrow by `user_id`. */
 function logsOwner(req, u) {
@@ -1707,6 +1728,19 @@ export function createPanelHandler(ctx) {
               : null,
         })
       }
+      // GET /api/panel/vms/kvm-capability?kernel=&node_id= — can that daemon run a KVM slot
+      if (req.method === 'GET' && p === '/api/panel/vms/kvm-capability') {
+        const u = new URL(req.url, 'http://x')
+        const nodeId = u.searchParams.get('node_id') || null
+        if (nodeId && panelIdentity(req).role !== 'admin') {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'placement_forbidden', message: '只有管理员可以把虚拟机放到集群节点' },
+          })
+        }
+        const kernel = OS_CATALOG[u.searchParams.get('kernel')] ? u.searchParams.get('kernel') : 'ubuntu-24.04'
+        return json(res, 200, panel.ok(await kvmCapabilityFor({ kernel, nodeId })))
+      }
       // GET /api/panel/vms/fleet-status — must be before /vms/:id
       if (req.method === 'GET' && p === '/api/panel/vms/fleet-status') {
         return json(res, 200, panel.ok({ items: fleetStatus(cfg.paths.project) }))
@@ -2924,6 +2958,7 @@ export function createPanelHandler(ctx) {
         const startNow = body.start !== false && body.status !== 'stopped'
         const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
         const nodeId = body.node_id ? String(body.node_id) : null
+        const wantKvm = body.runtime_type === 'kvm'
         if (nodeId) {
           if (ident.role !== 'admin') {
             return json(res, 403, {
@@ -2956,6 +2991,16 @@ export function createPanelHandler(ctx) {
                 message: '目标节点预检未通过',
                 checks: preflight.checks,
               },
+            })
+          }
+        }
+        // A KVM slot that cannot boot would sit in the list as a dead row; refuse before creating it.
+        if (wantKvm) {
+          const kvmCap = await kvmCapabilityFor({ kernel: wantKernel, nodeId })
+          if (!kvmCap.ok) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: kvmCap.code || 'kvm_unavailable', message: kvmCap.error || 'KVM 不可用' },
             })
           }
         }
@@ -3016,7 +3061,7 @@ export function createPanelHandler(ctx) {
           proxy_cli_enabled: body.proxy_cli_enabled === true,
           proxy_required: false,
           seed_policy: standardSeedPolicy(),
-          runtime: { type: body.runtime_type === 'kvm' ? 'kvm' : 'docker' },
+          runtime: { type: wantKvm ? 'kvm' : 'docker' },
         }
         if (ident.role === 'user') {
           vm.owner_user_id = normalizeOwnerId(req.panelUserId)

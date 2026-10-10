@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
-import { containerName } from '../vm/vm-runtime.mjs'
+import { containerName, slotExecArgs } from '../vm/vm-runtime.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 
 const WORKER_CONFIG = '/run/kin/worker.json'
@@ -98,8 +98,9 @@ export async function runSlotOauth(
 
   const host = slotHost(exec?.vm)
   const user = host.execUser({ ...exec?.vm, id: exec?.vmId || exec?.vm?.id })
-  const argv = ['exec', '-i', '-u', user, containerName(exec?.vmId), WORKER_BIN, 'oauth', op, '--config', WORKER_CONFIG]
-  if (force) argv.push('--force')
+  const raw = ['exec', '-i', '-u', user, containerName(exec?.vmId), WORKER_BIN, 'oauth', op, '--config', WORKER_CONFIG]
+  if (force) raw.push('--force')
+  const argv = slotExecArgs(exec?.vm, raw)
 
   const stdin =
     op === 'count-tokens'

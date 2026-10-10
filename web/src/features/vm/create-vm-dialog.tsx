@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { api, isApiError } from '@/lib/api'
 import { importErrorMessage } from '@/lib/import-errors'
@@ -46,7 +46,11 @@ import {
   PreflightCheckList,
   usePlacement,
 } from '@/features/vm/placement-field'
-import { vmsListQueryOptions } from '@/features/vm/queries'
+import {
+  type KvmCapability,
+  kvmCapabilityQueryOptions,
+  vmsListQueryOptions,
+} from '@/features/vm/queries'
 
 /** 「之后」的 5 档，对齐 index.html `createVmFromPage()` 的派生逻辑。 */
 export type CreateVmAfter = 'idle' | 'start' | 'proxy' | 'active' | 'full'
@@ -115,6 +119,7 @@ export function CreateVmFields({
   const [openaiConc, setOpenaiConc] = useState<number | null>(null)
   const [weight, setWeight] = useState<number>(DEFAULT_TEMPLATE.weight)
   const [platform, setPlatform] = useState<'anthropic' | 'openai'>('anthropic')
+  const [runtime, setRuntime] = useState<'docker' | 'kvm'>('docker')
   const [advOpen, setAdvOpen] = useState(false)
 
   // 名称留空时由后端编号：它还会跳过已删除槽位留下历史用量的序号，前端推不出来。
@@ -123,6 +128,13 @@ export function CreateVmFields({
   const remoteGpt = !!placement.nodeId && platform === 'openai'
   const exit = useCreateExit(placement.nodeId)
   const wantsExit = after !== 'idle'
+  // GPT 槽不走 Claude 内核，KVM 只对 Claude 槽有意义。
+  const kvmAllowed = platform === 'anthropic'
+  const wantsKvm = kvmAllowed && runtime === 'kvm'
+  const kvm = useQuery(
+    kvmCapabilityQueryOptions(kernel, placement.nodeId, wantsKvm)
+  )
+  const kvmBlocked = wantsKvm && (kvm.isFetching || kvm.data?.ok !== true)
 
   /** 切模板：回填内核/区域/语言/并发/权重与「之后」。时区不在这里选。 */
   function applyTemplate(id: string) {
@@ -164,6 +176,7 @@ export function CreateVmFields({
           family: platform === 'openai' ? 'codex' : 'claude',
           ...(nodeId ? { node_id: nodeId } : {}),
           ...(wantsExit && exit.proxyId ? { proxy_id: exit.proxyId } : {}),
+          ...(wantsKvm ? { runtime_type: 'kvm' } : {}),
         }),
       })
       return {
@@ -288,6 +301,27 @@ export function CreateVmFields({
         kernel={kernel}
         gptBlocked={remoteGpt}
       />
+
+      {kvmAllowed ? (
+        <div className='space-y-1'>
+          <Label>隔离</Label>
+          <Select
+            value={runtime}
+            onValueChange={(v) => {
+              if (v === 'docker' || v === 'kvm') setRuntime(v)
+            }}
+          >
+            <SelectTrigger aria-label='槽位隔离方式'>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value='docker'>容器（默认）</SelectItem>
+              <SelectItem value='kvm'>KVM 虚拟机</SelectItem>
+            </SelectContent>
+          </Select>
+          {wantsKvm ? <KvmCapabilityNote query={kvm} /> : null}
+        </div>
+      ) : null}
 
       <div className='space-y-1'>
         <Label>之后</Label>
@@ -451,7 +485,9 @@ export function CreateVmFields({
         ) : null}
         <Button
           onClick={() => create.mutate()}
-          disabled={create.isPending || placement.blocked || remoteGpt}
+          disabled={
+            create.isPending || placement.blocked || remoteGpt || kvmBlocked
+          }
           loading={create.isPending}
         >
           {submitLabel}
@@ -489,5 +525,39 @@ export function CreateVmDialog({
         />
       </DialogContent>
     </Dialog>
+  )
+}
+
+const KVM_HINT: Record<string, string> = {
+  kvm_unavailable:
+    '目标宿主没有可用的 /dev/kvm：需要裸机、开了嵌套虚拟化的 VPS，或 PVM 宿主内核。',
+  kvm_arch_unsupported:
+    'KVM 槽只支持 x86_64 宿主：槽内二进制只有 amd64，ARM 宿主的虚拟机里跑不了。',
+  kvm_image_missing: '目标宿主还没有 KVM 槽镜像，先拉取后再创建。',
+  docker_unavailable: '目标宿主的 Docker 无法启动探测容器。',
+}
+
+function KvmCapabilityNote({
+  query,
+}: {
+  query: ReturnType<typeof useQuery<KvmCapability>>
+}) {
+  if (query.isFetching) {
+    return <p className='text-xs text-muted-foreground'>正在检查目标宿主…</p>
+  }
+  if (query.data?.ok) {
+    return (
+      <p className='text-xs text-muted-foreground'>
+        槽内进程跑在独立内核的微虚拟机里，出口与身份同容器槽一致。
+      </p>
+    )
+  }
+  const code = query.data?.code || ''
+  const text =
+    KVM_HINT[code] ||
+    query.data?.error ||
+    (query.error as Error | null)?.message
+  return (
+    <p className='text-xs text-destructive'>{text || '无法确认 KVM 可用'}</p>
   )
 }

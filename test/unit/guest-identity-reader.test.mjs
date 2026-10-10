@@ -66,11 +66,18 @@ test('falls back to uname -n when the guest has no hostname command', async () =
   assert.equal(result.body.identity.hostname, (await promisify(execFile)('uname', ['-n'])).stdout.trim())
 })
 
-test('rejects unsupported runtimes without reading host identity', async () => {
+test('reads a KVM slot identity from inside the guest, not the runner', async () => {
+  let argv = null
   const result = await readGuestIdentity({ vmId: 'vm-01', vm: { runtime: { type: 'kvm' } } }, '', {
-    run: () => assert.fail('must not run Docker for KVM'),
+    run: async (_command, args) => {
+      argv = args
+      return { stdout: guestOutput }
+    },
   })
-  assert.equal(result.body.error.code, 'guest_identity_unsupported')
+  assert.deepEqual(argv.slice(0, 6), ['exec', 'kin-01', 'kin-guest', 'exec', '--vsock', '/run/kin-vmm/vsock.sock'])
+  assert.equal(argv.at(-1), READ_IDENTITY)
+  assert.equal(result.ok, true)
+  assert.equal(result.body.identity.runtime_kind, 'kvm')
 })
 
 test('reports stopped containers, timeouts and incomplete output as failures', async () => {

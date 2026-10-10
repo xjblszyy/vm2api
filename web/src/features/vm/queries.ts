@@ -101,3 +101,36 @@ export function vmOfficialCcQueryOptions(id: string) {
       query.state.data?.status === 'running' ? 2500 : false,
   })
 }
+
+export type KvmCapability = {
+  ok: boolean
+  code?:
+    | 'kvm_unavailable'
+    | 'kvm_arch_unsupported'
+    | 'kvm_image_missing'
+    | 'docker_unavailable'
+  error?: string
+  image?: string
+}
+
+/** 目标宿主（本机或节点）能否起 KVM 槽。后端问的是那台机器的 Docker，结果缓存 10 分钟。 */
+export function kvmCapabilityQueryOptions(
+  kernel: string,
+  nodeId: string,
+  enabled: boolean
+) {
+  return queryOptions({
+    queryKey: ['panel', 'vms', 'kvm-capability', kernel, nodeId] as const,
+    queryFn: () => {
+      const qs = new URLSearchParams({
+        kernel,
+        ...(nodeId ? { node_id: nodeId } : {}),
+      })
+      return api<KvmCapability>(`/api/panel/vms/kvm-capability?${qs}`)
+    },
+    enabled,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  })
+}
